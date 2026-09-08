@@ -3,6 +3,35 @@
 // Import this package with a blank identifier to enable SQLite support:
 //
 //	import _ "github.com/portablesql/psql-sqlite"
+//
+// # Connections and locking
+//
+// SQLite has no server; every *sql.DB connection is a separate handle on the
+// same database file. [New] configures the pool depending on the DSN:
+//
+//   - In-memory databases (":memory:" or any DSN containing "mode=memory") are
+//     private to the connection that opened them, so the pool is limited to a
+//     single connection (SetMaxOpenConns(1)). With one connection, any query
+//     issued while a *sql.Rows is still open, or issued from outside a
+//     transaction while that transaction is active, blocks forever waiting for
+//     the connection. Always close rows (or use Each/All helpers) before running
+//     the next query and keep all work of a transaction inside it.
+//   - File databases get a small pool (see [MaxOpenConns]) opened in WAL mode
+//     with "_txlock=immediate" and a busy timeout, so several readers can run
+//     concurrently with one writer. A second writer waits up to the busy
+//     timeout for the lock and then fails with SQLITE_BUSY instead of
+//     deadlocking.
+//
+// Every connection gets "PRAGMA busy_timeout", "PRAGMA journal_mode=WAL" and
+// "PRAGMA foreign_keys=ON" through DSN "_pragma" parameters; parameters already
+// present in the caller's DSN are left untouched.
+//
+// # Time values
+//
+// time.Time values are stored as TEXT in the fixed-width UTC form
+// "2006-01-02T15:04:05.000000000Z" so that lexical comparison and ordering of
+// stored timestamps match chronological order. The zero time is stored as
+// "0001-01-01T00:00:00.000000000Z".
 package sqlite
 
 import (
@@ -10,6 +39,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +47,22 @@ import (
 	"github.com/portablesql/psql"
 	_ "modernc.org/sqlite"
 )
+
+// TimeFormat is the layout used to store time.Time values. It is fixed-width
+// (nanosecond precision, always in UTC with a "Z" suffix) so that text ordering
+// of stored values matches chronological ordering.
+const TimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
+
+// ZeroTime is the stored representation of the zero time.Time.
+const ZeroTime = "0001-01-01T00:00:00.000000000Z"
+
+// MaxOpenConns is the size of the connection pool used for file-based
+// databases. In-memory databases always use a single connection.
+const MaxOpenConns = 8
+
+// BusyTimeout is the default "PRAGMA busy_timeout" applied to each connection
+// unless the DSN already specifies one.
+const BusyTimeout = 10 * time.Second
 
 func init() {
 	psql.RegisterDialect(psql.EngineSQLite, sqliteDialect{})
@@ -32,24 +78,33 @@ type sqliteDialect struct{}
 
 func (sqliteDialect) Placeholder(_ int) string { return "?" }
 
-func (sqliteDialect) LimitOffset(a, b int) string {
-	return "LIMIT " + strconv.Itoa(a) + " OFFSET " + strconv.Itoa(b)
+// LimitOffset renders "LIMIT count OFFSET offset". The arguments are
+// (offset, count), matching psql's QueryBuilder.Limit(offset, count).
+//
+// Deprecated: the core renders LIMIT/OFFSET itself and no longer calls this.
+func (sqliteDialect) LimitOffset(offset, count int) string {
+	return "LIMIT " + strconv.Itoa(count) + " OFFSET " + strconv.Itoa(offset)
 }
 
 func (sqliteDialect) ExportArg(v any) any {
 	switch val := v.(type) {
 	case time.Time:
-		if val.IsZero() {
-			return "0001-01-01T00:00:00.000000Z"
-		}
-		return val.UTC().Format(time.RFC3339Nano)
+		return formatTime(val)
 	case *time.Time:
 		if val == nil {
 			return nil
 		}
-		return val.UTC().Format(time.RFC3339Nano)
+		return formatTime(*val)
 	}
 	return psql.DefaultExportArg(v)
+}
+
+// formatTime renders t in the fixed-width UTC TimeFormat.
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ZeroTime
+	}
+	return t.UTC().Format(TimeFormat)
 }
 
 // TypeMapper implementation
@@ -138,36 +193,32 @@ func (sqliteDialect) KeyDef(k *psql.StructKey, tableName string) string {
 	return createIndexSQLite(k, tableName)
 }
 
+// InlineKeyDef renders the PRIMARY KEY clause for CREATE TABLE. UNIQUE keys are
+// created as named standalone indexes (see CreateIndex) so that CheckStructure
+// can find them by name; they are therefore not rendered inline.
 func (sqliteDialect) InlineKeyDef(k *psql.StructKey, tableName string) string {
-	s := &strings.Builder{}
-	switch k.Typ {
-	case psql.KeyPrimary:
-		s.WriteString("PRIMARY KEY (")
-		for i, f := range k.Fields {
-			if i > 0 {
-				s.WriteString(", ")
-			}
-			s.WriteString(psql.QuoteName(f))
-		}
-		s.WriteByte(')')
-		return s.String()
-	case psql.KeyUnique:
-		s.WriteString("UNIQUE (")
-		for i, f := range k.Fields {
-			if i > 0 {
-				s.WriteString(", ")
-			}
-			s.WriteString(psql.QuoteName(f))
-		}
-		s.WriteByte(')')
-		return s.String()
-	default:
-		return "" // non-inline indexes handled separately
+	if k.Typ != psql.KeyPrimary {
+		return "" // unique and other indexes are created as named indexes
 	}
+	s := &strings.Builder{}
+	s.WriteString("PRIMARY KEY (")
+	for i, f := range k.Fields {
+		if i > 0 {
+			s.WriteString(", ")
+		}
+		s.WriteString(psql.QuoteName(f))
+	}
+	s.WriteByte(')')
+	return s.String()
 }
 
 func (sqliteDialect) CreateIndex(k *psql.StructKey, tableName string) string {
 	return createIndexSQLite(k, tableName)
+}
+
+// indexName returns the name used for a standalone index on tableName.
+func indexName(k *psql.StructKey, tableName string) string {
+	return tableName + "_" + k.Key
 }
 
 func createIndexSQLite(k *psql.StructKey, tableName string) string {
@@ -185,7 +236,7 @@ func createIndexSQLite(k *psql.StructKey, tableName string) string {
 		return ""
 	}
 
-	s.WriteString(psql.QuoteName(tableName + "_" + k.Key))
+	s.WriteString(psql.QuoteName(indexName(k, tableName)))
 	s.WriteString(" ON ")
 	s.WriteString(psql.QuoteName(tableName))
 	s.WriteString(" (")
@@ -211,15 +262,29 @@ func (sqliteDialect) InsertIgnoreSQL(tableName, fldStr, placeholders string) str
 
 // DuplicateChecker implementation
 
+// IsDuplicate reports whether err (or any error it wraps, including joined
+// errors) is a SQLite UNIQUE constraint violation.
 func (sqliteDialect) IsDuplicate(err error) bool {
-	for e := err; e != nil; {
-		if strings.Contains(e.Error(), "UNIQUE constraint failed") {
-			return true
-		}
-		if u, ok := e.(interface{ Unwrap() error }); ok {
-			e = u.Unwrap()
-		} else {
-			break
+	return errorTreeContains(err, "UNIQUE constraint failed")
+}
+
+// errorTreeContains walks the error tree (Unwrap() error and Unwrap() []error)
+// and reports whether any error message contains needle.
+func errorTreeContains(err error, needle string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), needle) {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return errorTreeContains(u.Unwrap(), needle)
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if errorTreeContains(e, needle) {
+				return true
+			}
 		}
 	}
 	return false
@@ -247,25 +312,96 @@ func (sqliteFactory) CreateBackend(dsn string) (*psql.Backend, error) {
 	return New(strings.TrimPrefix(dsn, "sqlite:"))
 }
 
-// New creates a psql.Backend connected to a SQLite database at the given path.
-// Pass ":memory:" for an in-memory database. WAL mode and foreign keys are
-// enabled automatically.
+// isMemoryDSN reports whether dsn opens an in-memory database, which is
+// private to a single connection.
+func isMemoryDSN(dsn string) bool {
+	return strings.Contains(dsn, ":memory:") || strings.Contains(dsn, "mode=memory")
+}
+
+// prepareDSN adds the default connection parameters (busy timeout, WAL,
+// foreign keys, immediate transactions) to dsn unless the caller already set
+// them. modernc.org/sqlite strips the query string from non-"file:" DSNs after
+// applying the parameters, so this is safe for plain paths and ":memory:".
+func prepareDSN(dsn string) (string, error) {
+	base, rawQuery, _ := strings.Cut(dsn, "?")
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("invalid sqlite DSN parameters: %w", err)
+	}
+
+	hasPragma := func(name string) bool {
+		for _, p := range q["_pragma"] {
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(p)), name) {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasPragma("busy_timeout") {
+		q.Add("_pragma", "busy_timeout("+strconv.FormatInt(BusyTimeout.Milliseconds(), 10)+")")
+	}
+	if !hasPragma("journal_mode") {
+		q.Add("_pragma", "journal_mode(WAL)")
+	}
+	if !hasPragma("foreign_keys") {
+		q.Add("_pragma", "foreign_keys(1)")
+	}
+	if q.Get("_txlock") == "" {
+		q.Set("_txlock", "immediate")
+	}
+	return base + "?" + q.Encode(), nil
+}
+
+// New creates a psql.Backend connected to a SQLite database at the given path
+// or "file:" URI. Pass ":memory:" for an in-memory database.
+//
+// Each connection is opened with WAL journaling, foreign keys enabled, a busy
+// timeout of [BusyTimeout] and "_txlock=immediate"; any of these already
+// present in the DSN query string are kept as given.
+//
+// In-memory databases are private to one connection, so the pool is limited to
+// exactly one connection: a query issued while a *sql.Rows is still open, or a
+// query issued outside of an active transaction, waits forever for that
+// connection. Close rows before issuing the next query and keep all work of a
+// transaction inside it. File databases use a pool of up to [MaxOpenConns]
+// connections, so concurrent readers do not block each other or the writer.
 func New(dsn string) (*psql.Backend, error) {
-	db, err := sql.Open("sqlite", dsn)
+	memory := isMemoryDSN(dsn)
+
+	connDSN, err := prepareDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite", connDSN)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite connection failed: %w", err)
 	}
 
-	// SQLite doesn't handle concurrent writes well
-	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(0)
-
-	// Enable WAL mode and foreign keys
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		slog.Warn(fmt.Sprintf("[sqlite] failed to enable WAL mode: %s", err), "event", "psql:init:sqlite_wal")
+	db.SetConnMaxIdleTime(0)
+	if memory {
+		// An in-memory database only exists in the connection that opened it:
+		// never open a second one, and never let the first one be closed.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	} else {
+		db.SetMaxOpenConns(MaxOpenConns)
+		db.SetMaxIdleConns(MaxOpenConns)
 	}
-	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		slog.Warn(fmt.Sprintf("[sqlite] failed to enable foreign keys: %s", err), "event", "psql:init:sqlite_fk")
+
+	// Open the first connection now so DSN/pragma errors surface here rather
+	// than on the first query.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite connection failed: %w", err)
+	}
+
+	var journal string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&journal); err != nil {
+		slog.Warn(fmt.Sprintf("[sqlite] failed to read journal mode: %s", err), "event", "psql:init:sqlite_wal")
+	} else if !memory && !strings.EqualFold(journal, "wal") {
+		slog.Warn(fmt.Sprintf("[sqlite] journal mode is %s, not WAL", journal), "event", "psql:init:sqlite_wal")
 	}
 
 	be := psql.NewBackend(psql.EngineSQLite, db)
@@ -289,6 +425,71 @@ func sqliteTypeAffinity(typ string) string {
 	default:
 		return "text"
 	}
+}
+
+// existingIndexes describes the indexes currently defined on a table.
+type existingIndexes struct {
+	names   map[string]bool // index names (including sqlite_autoindex_*)
+	uniques map[string]bool // column lists ("a,b") of unique indexes, any origin
+}
+
+func (ei *existingIndexes) has(k *psql.StructKey, tableName string) bool {
+	if ei.names[indexName(k, tableName)] {
+		return true
+	}
+	if k.Typ == psql.KeyUnique && ei.uniques[strings.Join(k.Fields, ",")] {
+		// An inline UNIQUE constraint (sqlite_autoindex_*) or PRIMARY KEY
+		// already covers exactly these columns.
+		return true
+	}
+	return false
+}
+
+// readIndexes lists the indexes of tableName via PRAGMA index_list, resolving
+// the columns of unique indexes via PRAGMA index_info so that inline UNIQUE
+// constraints (created by older versions of this package) are recognised.
+func readIndexes(ctx context.Context, tableName string) (*existingIndexes, error) {
+	ei := &existingIndexes{names: map[string]bool{}, uniques: map[string]bool{}}
+
+	var uniqueNames []string
+	err := psql.Q(fmt.Sprintf("PRAGMA index_list(%s)", psql.QuoteName(tableName))).Each(ctx, func(rows *sql.Rows) error {
+		var seq int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return err
+		}
+		ei.names[name] = true
+		if unique == 1 && partial == 0 {
+			uniqueNames = append(uniqueNames, name)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("while reading index list: %w", err)
+	}
+
+	for _, name := range uniqueNames {
+		var cols []string
+		err := psql.Q(fmt.Sprintf("PRAGMA index_info(%s)", psql.QuoteName(name))).Each(ctx, func(rows *sql.Rows) error {
+			var seqno, cid int
+			var col *string
+			if err := rows.Scan(&seqno, &cid, &col); err != nil {
+				return err
+			}
+			if col != nil {
+				cols = append(cols, *col)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("while reading index %s: %w", name, err)
+		}
+		if len(cols) > 0 {
+			ei.uniques[strings.Join(cols, ",")] = true
+		}
+	}
+	return ei, nil
 }
 
 // checkStructureSQLite checks and creates the SQLite table structure.
@@ -355,27 +556,16 @@ func checkStructureSQLite(ctx context.Context, be *psql.Backend, tv psql.TableVi
 	}
 
 	// Check for missing indexes
-	existingIdxs := make(map[string]bool)
-	err = psql.Q(fmt.Sprintf("PRAGMA index_list(%s)", psql.QuoteName(tableName))).Each(ctx, func(rows *sql.Rows) error {
-		var seq int
-		var name, origin string
-		var unique, partial int
-		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
-			return err
-		}
-		existingIdxs[name] = true
-		return nil
-	})
+	existing, err := readIndexes(ctx, tableName)
 	if err != nil {
-		return fmt.Errorf("while reading index list: %w", err)
+		return err
 	}
 
 	for _, k := range tv.AllKeys() {
-		if k.Typ == psql.KeyPrimary {
+		if k.Typ == psql.KeyPrimary || len(k.Fields) == 0 {
 			continue
 		}
-		idxName := tableName + "_" + k.Key
-		if existingIdxs[idxName] {
+		if existing.has(k, tableName) {
 			continue
 		}
 		createSQL := createIndexSQLite(k, tableName)
@@ -406,14 +596,14 @@ func createTableSQLite(ctx context.Context, be *psql.Backend, tv psql.TableView)
 		sb.WriteString(f.DefString(be))
 	}
 
+	d := sqliteDialect{}
 	for _, k := range tv.AllKeys() {
 		if len(k.Fields) == 0 {
 			continue
 		}
-		if k.Typ == psql.KeyPrimary || k.Typ == psql.KeyUnique {
+		if inline := d.InlineKeyDef(k, tableName); inline != "" {
 			sb.WriteString(", ")
-			d := sqliteDialect{}
-			sb.WriteString(d.InlineKeyDef(k, tableName))
+			sb.WriteString(inline)
 		}
 	}
 
@@ -423,8 +613,10 @@ func createTableSQLite(ctx context.Context, be *psql.Backend, tv psql.TableView)
 		return fmt.Errorf("while creating table: %w", err)
 	}
 
+	// UNIQUE and INDEX keys are created as named indexes so CheckStructure can
+	// find them again by name on the next start.
 	for _, k := range tv.AllKeys() {
-		if len(k.Fields) == 0 || k.Typ == psql.KeyPrimary || k.Typ == psql.KeyUnique {
+		if len(k.Fields) == 0 {
 			continue
 		}
 		createSQL := createIndexSQLite(k, tableName)
