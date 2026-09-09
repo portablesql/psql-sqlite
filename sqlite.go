@@ -260,6 +260,23 @@ func (sqliteDialect) InsertIgnoreSQL(tableName, fldStr, placeholders string) str
 	return "INSERT OR IGNORE INTO " + psql.QuoteName(tableName) + " (" + fldStr + ") VALUES (" + placeholders + ")"
 }
 
+// ErrorClassifier implementation
+
+// ErrorNumber returns 0 for a nil error and 0xffff otherwise: SQLite errors
+// carry no MySQL-style error number. Use IsNotExist or IsDuplicate instead.
+func (sqliteDialect) ErrorNumber(err error) uint16 {
+	if err == nil {
+		return 0
+	}
+	return 0xffff
+}
+
+// IsNotExist reports whether err (or any error it wraps, including joined
+// errors) is a SQLite "no such table" or "no such column" error.
+func (sqliteDialect) IsNotExist(err error) bool {
+	return errorTreeContains(err, "no such table") || errorTreeContains(err, "no such column")
+}
+
 // DuplicateChecker implementation
 
 // IsDuplicate reports whether err (or any error it wraps, including joined
