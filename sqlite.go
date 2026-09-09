@@ -607,10 +607,14 @@ func createTableSQLite(ctx context.Context, be *psql.Backend, tv psql.TableView)
 	sb.WriteString(" (")
 
 	for n, f := range tv.AllFields() {
+		def := f.DefString(be)
+		if def == "" {
+			return fmt.Errorf("field %s.%s has no SQL type: add a type= or import= tag attribute", tv.TableName(), f.Name)
+		}
 		if n > 0 {
 			sb.WriteString(", ")
 		}
-		sb.WriteString(f.DefString(be))
+		sb.WriteString(def)
 	}
 
 	d := sqliteDialect{}
