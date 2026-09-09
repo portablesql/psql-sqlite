@@ -3,7 +3,7 @@ module github.com/portablesql/psql-sqlite
 go 1.25.0
 
 require (
-	github.com/portablesql/psql v0.5.9
+	github.com/portablesql/psql v0.5.10-0.20260909013314-13df57038114
 	modernc.org/sqlite v1.37.1
 )
 

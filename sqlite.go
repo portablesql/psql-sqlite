@@ -120,7 +120,26 @@ func (sqliteDialect) SqlType(baseType string, attrs map[string]string) string {
 	}
 }
 
+// isAutoInc reports whether the resolved attributes declare an autoinc
+// column (the core stores the autoinc attribute as autoinc=1).
+func isAutoInc(attrs map[string]string) bool {
+	switch attrs["autoinc"] {
+	case "1", "true":
+		return true
+	}
+	return false
+}
+
+// FieldDef renders a column definition. An autoinc column (see
+// psql.StructField.IsAutoInc) is always declared as exactly "integer",
+// whatever its declared SQL type, because only an INTEGER PRIMARY KEY is an
+// alias for the rowid and gets generated values; the value is assigned by
+// SQLite when the column is omitted from the INSERT, no AUTOINCREMENT
+// keyword is needed.
 func (sqliteDialect) FieldDef(column, sqlType string, nullable bool, attrs map[string]string) string {
+	if isAutoInc(attrs) {
+		sqlType = "integer"
+	}
 	mydef := psql.QuoteName(column) + " " + sqlType
 
 	if null, ok := attrs["null"]; ok {
@@ -147,6 +166,9 @@ func (sqliteDialect) FieldDef(column, sqlType string, nullable bool, attrs map[s
 }
 
 func (sqliteDialect) FieldDefAlter(column, sqlType string, nullable bool, attrs map[string]string) string {
+	if isAutoInc(attrs) {
+		sqlType = "integer"
+	}
 	mydef := psql.QuoteName(column) + " " + sqlType
 
 	hasDefault := false
@@ -221,6 +243,12 @@ func indexName(k *psql.StructKey, tableName string) string {
 	return tableName + "_" + k.Key
 }
 
+// createIndexSQLite renders the CREATE INDEX statement for a UNIQUE or INDEX
+// key: CREATE [UNIQUE] INDEX "table_key" ON "table" ("a", "b"). A key with
+// an expression attribute indexes the expression instead of the column list
+// (CREATE INDEX "t_k" ON "t" (lower("Name"))). FULLTEXT, SPATIAL and VECTOR
+// keys are silently ignored; GIN and GiST keys are PostgreSQL index methods
+// and are skipped with a warning.
 func createIndexSQLite(k *psql.StructKey, tableName string) string {
 	s := &strings.Builder{}
 
@@ -231,8 +259,19 @@ func createIndexSQLite(k *psql.StructKey, tableName string) string {
 		s.WriteString("CREATE UNIQUE INDEX ")
 	case psql.KeyIndex:
 		s.WriteString("CREATE INDEX ")
+	case psql.KeyGIN, psql.KeyGIST:
+		slog.Warn(fmt.Sprintf("[psql:check] key %s (GIN/GiST) is PostgreSQL-only and is skipped on SQLite", k.Key),
+			"event", "psql:check:skip_index", "psql.key", k.Key)
+		return ""
 	default:
 		// FULLTEXT, SPATIAL, VECTOR not supported in SQLite
+		return ""
+	}
+
+	expr := k.Expression()
+	if expr == "" && len(k.Fields) == 0 {
+		slog.Warn(fmt.Sprintf("[psql:check] key %s has neither columns nor an expression and is skipped", k.Key),
+			"event", "psql:check:skip_index", "psql.key", k.Key)
 		return ""
 	}
 
@@ -240,14 +279,40 @@ func createIndexSQLite(k *psql.StructKey, tableName string) string {
 	s.WriteString(" ON ")
 	s.WriteString(psql.QuoteName(tableName))
 	s.WriteString(" (")
-	for n, f := range k.Fields {
-		if n > 0 {
-			s.WriteString(", ")
+	if expr != "" {
+		s.WriteString(expr)
+	} else {
+		for n, f := range k.Fields {
+			if n > 0 {
+				s.WriteString(", ")
+			}
+			s.WriteString(psql.QuoteName(f))
 		}
-		s.WriteString(psql.QuoteName(f))
 	}
 	s.WriteByte(')')
 	return s.String()
+}
+
+// ReturningRenderer implementation
+
+// SupportsReturning reports that INSERT/UPDATE/DELETE ... RETURNING is
+// available: modernc.org/sqlite bundles SQLite 3.35 or later. psql.Insert
+// therefore refreshes inserted objects from the stored row (generated rowids
+// included) instead of reading LastInsertId, and psql.BulkInsert populates
+// generated keys. SQLite documents the order of RETURNING rows as
+// unspecified; in practice it is the insertion order, which multi-row
+// inserts rely on.
+func (sqliteDialect) SupportsReturning() bool {
+	return true
+}
+
+// RetryableChecker implementation
+
+// IsRetryable implements psql.RetryableChecker: SQLITE_BUSY ("database is
+// locked") and SQLITE_LOCKED ("database table is locked") mean another
+// connection holds a lock, so the transaction is worth retrying.
+func (sqliteDialect) IsRetryable(err error) bool {
+	return errorTreeContains(err, "database is locked") || errorTreeContains(err, "database table is locked")
 }
 
 // UpsertRenderer implementation
@@ -579,7 +644,7 @@ func checkStructureSQLite(ctx context.Context, be *psql.Backend, tv psql.TableVi
 	}
 
 	for _, k := range tv.AllKeys() {
-		if k.Typ == psql.KeyPrimary || len(k.Fields) == 0 {
+		if k.Typ == psql.KeyPrimary || len(k.Fields) == 0 && k.Expression() == "" {
 			continue
 		}
 		if existing.has(k, tableName) {
@@ -637,7 +702,7 @@ func createTableSQLite(ctx context.Context, be *psql.Backend, tv psql.TableView)
 	// UNIQUE and INDEX keys are created as named indexes so CheckStructure can
 	// find them again by name on the next start.
 	for _, k := range tv.AllKeys() {
-		if len(k.Fields) == 0 {
+		if len(k.Fields) == 0 && k.Expression() == "" {
 			continue
 		}
 		createSQL := createIndexSQLite(k, tableName)

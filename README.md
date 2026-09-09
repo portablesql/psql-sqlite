@@ -92,6 +92,17 @@ Connections have no max lifetime or idle time.
 - `Replace` renders `INSERT OR REPLACE INTO`, `InsertIgnore` renders `INSERT OR IGNORE INTO`;
   the query builder's `OnConflict(cols...).DoUpdate(...)` / `DoNothing()` render
   `ON CONFLICT ... DO UPDATE` / `DO NOTHING`.
+- `RETURNING` is supported on `INSERT`, `UPDATE` and `DELETE` (modernc.org/sqlite bundles
+  SQLite 3.35 or later): the query builder's `Returning(...)` renders it, `psql.Insert`
+  refreshes inserted objects from the stored row (generated rowids included) instead of reading
+  `LastInsertId`, and `psql.BulkInsert` populates generated keys. `INSERT OR IGNORE ...
+  RETURNING` yields no row for an ignored conflict, which leaves the object untouched. SQLite
+  documents the order of `RETURNING` rows as unspecified; in practice it is the insertion order,
+  which multi-row inserts rely on to match rows back to objects.
+- The backend reports `psql.VariantSQLite`; `be.Supports(...)` is true for `FeatureReturning`,
+  `FeatureCTE`, `FeatureJSON` and `FeatureIdentityColumns` only. Named locks, full-text search,
+  `DISTINCT ON` and the other server-side features return an error wrapping
+  `psql.ErrNotSupported`.
 - `FOR UPDATE` (and `SKIP LOCKED` / `NOWAIT`) is silently omitted; SQLite locks at the
   database level.
 - `CILike` renders `LOWER(col) LIKE LOWER(pattern)`; `Greatest`/`Least` render multi-argument
@@ -122,7 +133,11 @@ ignored:
 | `type=JSON` (magic type) | `TEXT` with `format=json` |
 
 Column definitions honor `null=0/1` and `default=...` (`default=\N` gives `DEFAULT NULL`);
-the `collation` attribute is ignored. When a `NOT NULL` column is added to an existing table
+the `collation` attribute is ignored. A field declared with the `autoinc` attribute
+(`ID uint64 \`sql:",key=PRIMARY,autoinc"\``) is always rendered as exactly `"ID" integer`,
+whatever its declared type: only an `INTEGER PRIMARY KEY` aliases the rowid and receives a
+generated value when the column is omitted from the `INSERT` (no `AUTOINCREMENT` keyword is
+used). When a `NOT NULL` column is added to an existing table
 with `ALTER TABLE`, SQLite requires a default, so `DEFAULT 0` (integer), `DEFAULT 0.0` (real)
 or `DEFAULT ''` (other) is added when the struct declares none.
 
@@ -139,8 +154,12 @@ Two things SQLite does **not** do:
 - `PRIMARY KEY (...)` is created inline in `CREATE TABLE`.
 - `UNIQUE` and `INDEX` keys are created as named standalone indexes
   (`CREATE UNIQUE INDEX "table_key" ...` / `CREATE INDEX "table_key" ...`) so the schema check
-  can find them again by name.
-- `FULLTEXT`, `SPATIAL` and `VECTOR` keys are not supported and are ignored.
+  can find them again by name. A key declared with an `expression` attribute instead of
+  `fields` indexes that expression, with `{Column}` replaced by the quoted column name:
+  `CREATE INDEX "t_lower" ON "t" (lower("Name"))`.
+- `FULLTEXT`, `SPATIAL` and `VECTOR` keys are not supported and are ignored; `GIN` and `GIST`
+  keys (PostgreSQL index methods) and keys with neither columns nor an expression are skipped
+  with a warning (`psql:check:skip_index`).
 
 ### Schema check
 
@@ -165,6 +184,10 @@ SQLite errors carry no numeric code that psql can classify, so `psql.ErrorNumber
 
 `psql.IsDuplicate(err)` is true when any error in the tree (wrapped and joined errors included)
 contains `UNIQUE constraint failed`.
+
+`psql.IsRetryable(err)` is true when any error in the tree contains `database is locked`
+(`SQLITE_BUSY`) or `database table is locked` (`SQLITE_LOCKED`): another connection holds a
+lock, and `psql.Tx` / `psql.TxWithOptions` retry the transaction.
 
 ## Testing
 
