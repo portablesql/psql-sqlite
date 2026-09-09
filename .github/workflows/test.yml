@@ -46,13 +46,21 @@ jobs:
         with:
           repository: portablesql/psql-test
           path: psql-test
+      - uses: actions/checkout@v4
+        with:
+          repository: portablesql/psql-mysql
+          path: psql-mysql
+      - uses: actions/checkout@v4
+        with:
+          repository: portablesql/psql-pgsql
+          path: psql-pgsql
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           check-latest: true
       - name: Setup workspace
         run: |
-          go work init ./psql ./psql-sqlite ./psql-test
+          go work init ./psql ./psql-mysql ./psql-pgsql ./psql-sqlite ./psql-test
           go work sync
       - name: Build psql-test
         working-directory: psql-test
